@@ -149,6 +149,50 @@ describe("LlamaCpp rerank deduping", () => {
   });
 });
 
+describe("LlamaCpp embed context sizing", () => {
+  test("bounds embed context size and uses model estimates to limit parallel contexts", async () => {
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 0 }) as any;
+    const gib = 1024 ** 3;
+    const createEmbeddingContext = vi.fn(async (_options: unknown) => ({ dispose: vi.fn() }));
+    const estimateContextResourceRequirements = vi.fn(() => ({
+      gpuVram: 8 * gib,
+      cpuRam: 0,
+    }));
+
+    llm.ensureLlama = vi.fn().mockResolvedValue({
+      gpu: "vulkan",
+      getVramState: vi.fn().mockResolvedValue({
+        free: 120 * gib,
+      }),
+      cpuMathCores: 16,
+    });
+
+    llm.ensureEmbedModel = vi.fn().mockResolvedValue({
+      gpuLayers: 37,
+      fileInsights: {
+        estimateContextResourceRequirements,
+      },
+      createEmbeddingContext,
+    });
+
+    const contexts = await llm.ensureEmbedContexts();
+
+    expect(contexts).toHaveLength(2);
+    expect(estimateContextResourceRequirements).toHaveBeenCalledWith(
+      expect.objectContaining({
+        contextSize: 2048,
+        isEmbeddingContext: true,
+        modelGpuLayers: 37,
+      })
+    );
+    expect(createEmbeddingContext).toHaveBeenCalledTimes(2);
+    expect(createEmbeddingContext).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ contextSize: 2048 })
+    );
+  });
+});
+
 // =============================================================================
 // Integration Tests (require actual models)
 // =============================================================================

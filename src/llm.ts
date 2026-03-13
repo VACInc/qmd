@@ -192,11 +192,15 @@ export type RerankDocument = {
 
 // HuggingFace model URIs for node-llama-cpp
 // Format: hf:<user>/<repo>/<file>
-// Override via QMD_EMBED_MODEL env var (e.g. hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf)
+// Override via environment variables before launching QMD.
 const DEFAULT_EMBED_MODEL = process.env.QMD_EMBED_MODEL ?? "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
-const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
+const DEFAULT_RERANK_MODEL =
+  process.env.QMD_RERANK_MODEL
+  ?? "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
-const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
+const DEFAULT_GENERATE_MODEL =
+  process.env.QMD_GENERATE_MODEL
+  ?? "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 
 // Alternative generation models for query expansion:
 // LiquidAI LFM2 - hybrid architecture optimized for edge/on-device inference
@@ -405,6 +409,14 @@ function resolveExpandContextSize(configValue?: number): number {
 }
 
 export class LlamaCpp implements LLM {
+  // QMD chunks documents to ~900 tokens. Keep embed contexts bounded so large
+  // train contexts on Qwen embedding models do not explode unified-memory use.
+  private static readonly EMBED_CONTEXT_SIZE = 2048;
+  private static readonly GPU_CONTEXT_BUDGET_FRACTION = 0.25;
+  private static readonly GPU_CONTEXT_ESTIMATE_SAFETY_MULTIPLIER = 1.5;
+  private static readonly FALLBACK_EMBED_CONTEXT_MB = 1024;
+  private static readonly FALLBACK_RERANK_CONTEXT_MB = 1024;
+
   private readonly _ciMode = !!process.env.CI;
   private llama: Llama | null = null;
   private embedModel: LlamaModel | null = null;
@@ -600,25 +612,62 @@ export class LlamaCpp implements LLM {
     }
   }
 
+  private async estimateContextBudgetBytes(
+    model: LlamaModel,
+    options: {
+      contextSize: number;
+      isEmbeddingContext: boolean;
+      flashAttention?: boolean;
+      fallbackPerContextMB: number;
+    }
+  ): Promise<number> {
+    const fallbackBytes = options.fallbackPerContextMB * 1024 * 1024;
+    try {
+      const estimate = model.fileInsights.estimateContextResourceRequirements({
+        contextSize: options.contextSize,
+        modelGpuLayers: model.gpuLayers,
+        sequences: 1,
+        isEmbeddingContext: options.isEmbeddingContext,
+        flashAttention: options.flashAttention,
+        swaFullCache: false,
+      });
+      return Math.max(
+        fallbackBytes,
+        Math.ceil(estimate.gpuVram * LlamaCpp.GPU_CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)
+      );
+    } catch {
+      return fallbackBytes;
+    }
+  }
+
   /**
    * Compute how many parallel contexts to create.
    *
-   * GPU: constrained by VRAM (25% of free, capped at 8).
+   * GPU: constrained by estimated context VRAM usage (25% of free, capped).
    * CPU: constrained by cores. Splitting threads across contexts enables
    *      true parallelism (each context runs on its own cores). Use at most
    *      half the math cores, with at least 4 threads per context.
    */
-  private async computeParallelism(perContextMB: number): Promise<number> {
+  private async computeParallelism(options: {
+    model: LlamaModel;
+    contextSize: number;
+    isEmbeddingContext: boolean;
+    flashAttention?: boolean;
+    maxContexts: number;
+    fallbackPerContextMB: number;
+  }): Promise<number> {
     const llama = await this.ensureLlama();
 
     if (llama.gpu) {
       try {
         const vram = await llama.getVramState();
-        const freeMB = vram.free / (1024 * 1024);
-        const maxByVram = Math.floor((freeMB * 0.25) / perContextMB);
-        return Math.max(1, Math.min(8, maxByVram));
+        const perContextBytes = await this.estimateContextBudgetBytes(options.model, options);
+        const maxByVram = Math.floor(
+          (vram.free * LlamaCpp.GPU_CONTEXT_BUDGET_FRACTION) / perContextBytes
+        );
+        return Math.max(1, Math.min(options.maxContexts, maxByVram));
       } catch {
-        return 2;
+        return 1;
       }
     }
 
@@ -657,12 +706,18 @@ export class LlamaCpp implements LLM {
 
     this.embedContextsCreatePromise = (async () => {
       const model = await this.ensureEmbedModel();
-      // Embed contexts are ~143 MB each (nomic-embed 2048 ctx)
-      const n = await this.computeParallelism(150);
+      const n = await this.computeParallelism({
+        model,
+        contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
+        isEmbeddingContext: true,
+        maxContexts: 8,
+        fallbackPerContextMB: LlamaCpp.FALLBACK_EMBED_CONTEXT_MB,
+      });
       const threads = await this.threadsPerContext(n);
       for (let i = 0; i < n; i++) {
         try {
           this.embedContexts.push(await model.createEmbeddingContext({
+            contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
             ...(threads > 0 ? { threads } : {}),
           }));
         } catch {
@@ -763,8 +818,14 @@ export class LlamaCpp implements LLM {
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length === 0) {
       const model = await this.ensureRerankModel();
-      // ~960 MB per context with flash attention at contextSize 2048
-      const n = Math.min(await this.computeParallelism(1000), 4);
+      const n = await this.computeParallelism({
+        model,
+        contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
+        isEmbeddingContext: false,
+        flashAttention: true,
+        maxContexts: 4,
+        fallbackPerContextMB: LlamaCpp.FALLBACK_RERANK_CONTEXT_MB,
+      });
       const threads = await this.threadsPerContext(n);
       for (let i = 0; i < n; i++) {
         try {
