@@ -25,6 +25,7 @@ import {
   formatDocForEmbedding,
   withLLMSessionForLlm,
   DEFAULT_EMBED_MODEL_URI,
+  SessionReleasedError,
   type LLMSessionOptions,
   type RerankDocument,
   type ILLMSession,
@@ -1288,7 +1289,10 @@ export async function generateEmbeddings(
 
   // Use store's LlamaCpp or global singleton, wrapped in a session
   const llm = getLlm(store);
-  const sessionOptions: LLMSessionOptions = { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' };
+  // Full-corpus embedding runs can legitimately take hours on local hardware.
+  // Disabling the session cap avoids silently converting the remainder of the
+  // corpus into "failed chunks" once the old 30-minute timer elapsed.
+  const sessionOptions: LLMSessionOptions = { maxDuration: 0, name: 'generateEmbeddings' };
 
   // Create a session manager for this llm instance
   const result = await withLLMSessionForLlm(llm, async (session) => {
@@ -1331,7 +1335,10 @@ export async function generateEmbeddings(
           }
           bytesProcessed += chunk.bytes;
         }
-      } catch {
+      } catch (err) {
+        if (err instanceof SessionReleasedError) {
+          throw err;
+        }
         // Batch failed — try individual embeddings as fallback
         for (const chunk of batch) {
           try {
@@ -1351,7 +1358,10 @@ export async function generateEmbeddings(
             } else {
               errors++;
             }
-          } catch {
+          } catch (err) {
+            if (err instanceof SessionReleasedError) {
+              throw err;
+            }
             errors++;
           }
           bytesProcessed += chunk.bytes;

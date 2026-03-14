@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
 import * as llmModule from "../src/llm.js";
-import { DEFAULT_EMBED_MODEL_URI, disposeDefaultLlamaCpp } from "../src/llm.js";
+import { DEFAULT_EMBED_MODEL_URI, SessionReleasedError, disposeDefaultLlamaCpp } from "../src/llm.js";
 import {
   createStore,
   verifySqliteVecLoaded,
@@ -38,6 +38,7 @@ import {
   reciprocalRankFusion,
   extractSnippet,
   getCacheKey,
+  generateEmbeddings,
   handelize,
   normalizeVirtualPath,
   isVirtualPath,
@@ -2101,6 +2102,83 @@ describe("Index Status", () => {
     expect(results).toEqual([]);
 
     await cleanupTestDb(store);
+  });
+});
+
+describe("Embedding Generation", () => {
+  test("generateEmbeddings disables the session max duration for long-running rebuilds", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    await insertTestDocument(store.db, collectionName, {
+      name: "doc1",
+      body: "# Doc\n\nA short embedding test body.",
+    });
+
+    const tokenizeSpy = vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue({
+      tokenize: vi.fn(async (_text: string) => [1, 2, 3, 4]),
+    } as any);
+    const withSessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm").mockImplementation(
+      async (_llm, fn, options) => {
+        expect(options).toMatchObject({ maxDuration: 0, name: "generateEmbeddings" });
+        return await fn({
+          embed: vi.fn(async () => ({ embedding: [0.1, 0.2], model: DEFAULT_EMBED_MODEL_URI })),
+          embedBatch: vi.fn(async (texts: string[]) =>
+            texts.map(() => ({ embedding: [0.1, 0.2], model: DEFAULT_EMBED_MODEL_URI }))
+          ),
+          expandQuery: vi.fn(),
+          rerank: vi.fn(),
+          isValid: true,
+          signal: new AbortController().signal,
+        } as any);
+      }
+    );
+
+    try {
+      const result = await generateEmbeddings(store, { model: DEFAULT_EMBED_MODEL_URI });
+      expect(result.chunksEmbedded).toBeGreaterThan(0);
+      expect(withSessionSpy).toHaveBeenCalled();
+    } finally {
+      withSessionSpy.mockRestore();
+      tokenizeSpy.mockRestore();
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings fails fast when the embedding session is released", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    await insertTestDocument(store.db, collectionName, {
+      name: "doc1",
+      body: "# Doc\n\nA short embedding test body.",
+    });
+
+    const tokenizeSpy = vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue({
+      tokenize: vi.fn(async (_text: string) => [1, 2, 3, 4]),
+    } as any);
+    const withSessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm").mockImplementation(
+      async (_llm, fn) => {
+        return await fn({
+          embed: vi.fn(async () => ({ embedding: [0.1, 0.2], model: DEFAULT_EMBED_MODEL_URI })),
+          embedBatch: vi.fn(async () => {
+            throw new SessionReleasedError("expired");
+          }),
+          expandQuery: vi.fn(),
+          rerank: vi.fn(),
+          isValid: false,
+          signal: new AbortController().signal,
+        } as any);
+      }
+    );
+
+    try {
+      await expect(
+        generateEmbeddings(store, { model: DEFAULT_EMBED_MODEL_URI })
+      ).rejects.toThrow(SessionReleasedError);
+    } finally {
+      withSessionSpy.mockRestore();
+      tokenizeSpy.mockRestore();
+      await cleanupTestDb(store);
+    }
   });
 });
 
