@@ -24,6 +24,7 @@ import {
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
+  DEFAULT_EMBED_MODEL_URI,
   type LLMSessionOptions,
   type RerankDocument,
   type ILLMSession,
@@ -45,6 +46,7 @@ export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
 export const DEFAULT_GLOB = "**/*.md";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
+const SQLITE_BUSY_TIMEOUT_MS = 5000;
 
 // Chunking: 900 tokens per chunk with 15% overlap
 // Increased from 800 to accommodate smart chunking finding natural break points
@@ -612,6 +614,47 @@ function getErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+function resolveEmbedModelIdentity(model?: string): string {
+  if (!model || model === DEFAULT_EMBED_MODEL) {
+    return DEFAULT_EMBED_MODEL_URI;
+  }
+  return model;
+}
+
+function isSqliteBusyError(err: unknown): boolean {
+  const message = getErrorMessage(err).toLowerCase();
+  return message.includes("database is locked") || message.includes("sqlite_busy");
+}
+
+function isVectorDimensionMismatchError(err: unknown): boolean {
+  return getErrorMessage(err).includes("Dimension mismatch for query vector");
+}
+
+function runBestEffortCacheMutation<T>(mutation: () => T, fallback: T): T {
+  try {
+    return mutation();
+  } catch (err) {
+    if (isSqliteBusyError(err)) {
+      return fallback;
+    }
+    throw err;
+  }
+}
+
+function hasCompatibleVectorIndex(db: Database, model?: string): boolean {
+  const tableExists = db.prepare(
+    `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
+  ).get();
+  if (!tableExists) {
+    return false;
+  }
+  const expectedModel = resolveEmbedModelIdentity(model);
+  const row = db.prepare(
+    `SELECT 1 AS ok FROM content_vectors WHERE seq = 0 AND model = ? LIMIT 1`
+  ).get(expectedModel) as { ok: number } | null;
+  return !!row?.ok;
+}
+
 export function verifySqliteVecLoaded(db: Database): void {
   try {
     const row = db.prepare(`SELECT vec_version() AS version`).get() as { version?: string } | null;
@@ -635,7 +678,10 @@ function initializeDatabase(db: Database): void {
     // sqlite-vec is optional — vector search won't work but FTS is fine
     _sqliteVecAvailable = false;
   }
-  db.exec("PRAGMA journal_mode = WAL");
+  db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+  runBestEffortCacheMutation(() => {
+    db.exec("PRAGMA journal_mode = WAL");
+  }, undefined);
   db.exec("PRAGMA foreign_keys = ON");
 
   // Drop legacy tables that are now managed in YAML
@@ -976,7 +1022,7 @@ export type Store = {
   ensureVecTable: (dimensions: number) => void;
 
   // Index health
-  getHashesNeedingEmbedding: () => number;
+  getHashesNeedingEmbedding: (model?: string) => number;
   getIndexHealth: () => IndexHealthInfo;
   getStatus: () => IndexStatus;
 
@@ -1035,7 +1081,7 @@ export type Store = {
   getActiveDocumentPaths: (collectionName: string) => string[];
 
   // Vector/embedding operations
-  getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
+  getHashesForEmbedding: (model?: string) => { hash: string; body: string; path: string }[];
   clearAllEmbeddings: () => void;
   insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => void;
 };
@@ -1193,14 +1239,14 @@ export async function generateEmbeddings(
   }
 ): Promise<EmbedResult> {
   const db = store.db;
-  const model = options?.model ?? DEFAULT_EMBED_MODEL;
+  const configuredModel = resolveEmbedModelIdentity(options?.model);
   const now = new Date().toISOString();
 
   if (options?.force) {
     clearAllEmbeddings(db);
   }
 
-  const hashesToEmbed = getHashesForEmbedding(db);
+  const hashesToEmbed = getHashesForEmbedding(db, configuredModel);
 
   if (hashesToEmbed.length === 0) {
     return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
@@ -1253,6 +1299,7 @@ export async function generateEmbeddings(
     if (!firstResult) {
       throw new Error("Failed to get embedding dimensions from first chunk");
     }
+    const activeModel = firstResult.model || configuredModel;
     store.ensureVecTable(firstResult.embedding.length);
 
     let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
@@ -1269,7 +1316,15 @@ export async function generateEmbeddings(
           const chunk = batch[i]!;
           const embedding = embeddings[i];
           if (embedding) {
-            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+            insertEmbedding(
+              db,
+              chunk.hash,
+              chunk.seq,
+              chunk.pos,
+              new Float32Array(embedding.embedding),
+              embedding.model || activeModel,
+              now
+            );
             chunksEmbedded++;
           } else {
             errors++;
@@ -1283,7 +1338,15 @@ export async function generateEmbeddings(
             const text = formatDocForEmbedding(chunk.text, chunk.title);
             const result = await session.embed(text);
             if (result) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+              insertEmbedding(
+                db,
+                chunk.hash,
+                chunk.seq,
+                chunk.pos,
+                new Float32Array(result.embedding),
+                result.model || activeModel,
+                now
+              );
               chunksEmbedded++;
             } else {
               errors++;
@@ -1328,7 +1391,7 @@ export function createStore(dbPath?: string): Store {
     ensureVecTable: (dimensions: number) => ensureVecTableInternal(db, dimensions),
 
     // Index health
-    getHashesNeedingEmbedding: () => getHashesNeedingEmbedding(db),
+    getHashesNeedingEmbedding: (model?: string) => getHashesNeedingEmbedding(db, model),
     getIndexHealth: () => getIndexHealth(db),
     getStatus: () => getStatus(db),
 
@@ -1387,7 +1450,7 @@ export function createStore(dbPath?: string): Store {
     getActiveDocumentPaths: (collectionName: string) => getActiveDocumentPaths(db, collectionName),
 
     // Vector/embedding operations
-    getHashesForEmbedding: () => getHashesForEmbedding(db),
+    getHashesForEmbedding: (model?: string) => getHashesForEmbedding(db, model),
     clearAllEmbeddings: () => clearAllEmbeddings(db),
     insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt),
   };
@@ -1589,13 +1652,14 @@ export type IndexStatus = {
 // Index health
 // =============================================================================
 
-export function getHashesNeedingEmbedding(db: Database): number {
+export function getHashesNeedingEmbedding(db: Database, model?: string): number {
+  const expectedModel = resolveEmbedModelIdentity(model);
   const result = db.prepare(`
     SELECT COUNT(DISTINCT d.hash) as count
     FROM documents d
     LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-    WHERE d.active = 1 AND v.hash IS NULL
-  `).get() as { count: number };
+    WHERE d.active = 1 AND (v.hash IS NULL OR v.model != ?)
+  `).get(expectedModel) as { count: number };
   return result.count;
 }
 
@@ -1637,14 +1701,20 @@ export function getCachedResult(db: Database, cacheKey: string): string | null {
 
 export function setCachedResult(db: Database, cacheKey: string, result: string): void {
   const now = new Date().toISOString();
-  db.prepare(`INSERT OR REPLACE INTO llm_cache (hash, result, created_at) VALUES (?, ?, ?)`).run(cacheKey, result, now);
+  runBestEffortCacheMutation(() => {
+    db.prepare(`INSERT OR REPLACE INTO llm_cache (hash, result, created_at) VALUES (?, ?, ?)`).run(cacheKey, result, now);
+  }, undefined);
   if (Math.random() < 0.01) {
-    db.exec(`DELETE FROM llm_cache WHERE hash NOT IN (SELECT hash FROM llm_cache ORDER BY created_at DESC LIMIT 1000)`);
+    runBestEffortCacheMutation(() => {
+      db.exec(`DELETE FROM llm_cache WHERE hash NOT IN (SELECT hash FROM llm_cache ORDER BY created_at DESC LIMIT 1000)`);
+    }, undefined);
   }
 }
 
 export function clearCache(db: Database): void {
-  db.exec(`DELETE FROM llm_cache`);
+  runBestEffortCacheMutation(() => {
+    db.exec(`DELETE FROM llm_cache`);
+  }, undefined);
 }
 
 // =============================================================================
@@ -1656,8 +1726,10 @@ export function clearCache(db: Database): void {
  * Returns the number of cached responses deleted.
  */
 export function deleteLLMCache(db: Database): number {
-  const result = db.prepare(`DELETE FROM llm_cache`).run();
-  return result.changes;
+  return runBestEffortCacheMutation(() => {
+    const result = db.prepare(`DELETE FROM llm_cache`).run();
+    return result.changes;
+  }, 0);
 }
 
 /**
@@ -2673,8 +2745,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // =============================================================================
 
 export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
-  const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
-  if (!tableExists) return [];
+  if (!hasCompatibleVectorIndex(db, model)) return [];
 
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session);
   if (!embedding) return [];
@@ -2685,11 +2756,19 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // See: https://github.com/tobi/qmd/pull/23
 
   // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
-  const vecResults = db.prepare(`
-    SELECT hash_seq, distance
-    FROM vectors_vec
-    WHERE embedding MATCH ? AND k = ?
-  `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
+  let vecResults: { hash_seq: string; distance: number }[];
+  try {
+    vecResults = db.prepare(`
+      SELECT hash_seq, distance
+      FROM vectors_vec
+      WHERE embedding MATCH ? AND k = ?
+    `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
+  } catch (err) {
+    if (isVectorDimensionMismatchError(err)) {
+      return [];
+    }
+    throw err;
+  }
 
   if (vecResults.length === 0) return [];
 
@@ -2775,15 +2854,16 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
  * Get all unique content hashes that need embeddings (from active documents).
  * Returns hash, document body, and a sample path for display purposes.
  */
-export function getHashesForEmbedding(db: Database): { hash: string; body: string; path: string }[] {
+export function getHashesForEmbedding(db: Database, model?: string): { hash: string; body: string; path: string }[] {
+  const expectedModel = resolveEmbedModelIdentity(model);
   return db.prepare(`
     SELECT d.hash, c.doc as body, MIN(d.path) as path
     FROM documents d
     JOIN content c ON d.hash = c.hash
     LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-    WHERE d.active = 1 AND v.hash IS NULL
+    WHERE d.active = 1 AND (v.hash IS NULL OR v.model != ?)
     GROUP BY d.hash
-  `).all() as { hash: string; body: string; path: string }[];
+  `).all(expectedModel) as { hash: string; body: string; path: string }[];
 }
 
 /**
@@ -3350,7 +3430,7 @@ export function getStatus(db: Database): IndexStatus {
 
   const totalDocs = (db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 1`).get() as { c: number }).c;
   const needsEmbedding = getHashesNeedingEmbedding(db);
-  const hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  const hasVectors = hasCompatibleVectorIndex(db);
 
   return {
     totalDocuments: totalDocs,
@@ -3581,9 +3661,7 @@ export async function hybridQuery(
   const rankedLists: RankedResult[][] = [];
   const rankedListMeta: RankedListMeta[] = [];
   const docidMap = new Map<string, string>(); // filepath -> docid
-  const hasVectors = !!store.db.prepare(
-    `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
-  ).get();
+  const hasVectors = hasCompatibleVectorIndex(store.db, DEFAULT_EMBED_MODEL);
 
   // Step 1: BM25 probe — strong signal skips expensive LLM expansion
   // When intent is provided, disable strong-signal bypass — the obvious BM25
@@ -3881,9 +3959,7 @@ export async function vectorSearchQuery(
   const collection = options?.collection;
   const intent = options?.intent;
 
-  const hasVectors = !!store.db.prepare(
-    `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
-  ).get();
+  const hasVectors = hasCompatibleVectorIndex(store.db, DEFAULT_EMBED_MODEL);
   if (!hasVectors) return [];
 
   // Expand query — filter to vec/hyde only (lex queries target FTS, not vector)
@@ -3997,9 +4073,7 @@ export async function structuredSearch(
   const rankedLists: RankedResult[][] = [];
   const rankedListMeta: RankedListMeta[] = [];
   const docidMap = new Map<string, string>(); // filepath -> docid
-  const hasVectors = !!store.db.prepare(
-    `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
-  ).get();
+  const hasVectors = hasCompatibleVectorIndex(store.db, DEFAULT_EMBED_MODEL);
 
   // Helper to run search across collections (or all if undefined)
   const collectionList = collections ?? [undefined]; // undefined = all collections

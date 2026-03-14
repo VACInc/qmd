@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
 import * as llmModule from "../src/llm.js";
-import { disposeDefaultLlamaCpp } from "../src/llm.js";
+import { DEFAULT_EMBED_MODEL_URI, disposeDefaultLlamaCpp } from "../src/llm.js";
 import {
   createStore,
   verifySqliteVecLoaded,
@@ -2032,6 +2032,30 @@ describe("Index Status", () => {
     await cleanupTestDb(store);
   });
 
+  test("getHashesNeedingEmbedding counts stale model embeddings", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    const hash = "stale-hash";
+
+    await insertTestDocument(store.db, collectionName, { name: "doc1", hash });
+    store.ensureVecTable(2);
+    store.db.prepare(`
+      INSERT INTO content_vectors (hash, seq, pos, model, embedded_at)
+      VALUES (?, 0, 0, ?, ?)
+    `).run(hash, "legacy-embed-model", new Date().toISOString());
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`)
+      .run(`${hash}_0`, new Float32Array([0.4, 0.6]));
+
+    expect(store.getHashesNeedingEmbedding()).toBe(1);
+    expect(store.getStatus().needsEmbedding).toBe(1);
+    expect(store.getStatus().hasVectorIndex).toBe(false);
+    expect(store.getHashesForEmbedding()).toEqual([
+      expect.objectContaining({ hash }),
+    ]);
+
+    await cleanupTestDb(store);
+  });
+
   test("getIndexHealth returns health info", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
@@ -2042,6 +2066,39 @@ describe("Index Status", () => {
     expect(health).toHaveProperty("totalDocs");
     expect(health).toHaveProperty("daysStale");
     expect(health.totalDocs).toBe(1);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec returns empty when vector dimensions do not match the query embedding", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    const hash = "mismatch-hash";
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "doc1",
+      hash,
+      body: "Dimension mismatch regression doc",
+    });
+
+    store.ensureVecTable(2);
+    store.db.prepare(`
+      INSERT INTO content_vectors (hash, seq, pos, model, embedded_at)
+      VALUES (?, 0, 0, ?, ?)
+    `).run(hash, DEFAULT_EMBED_MODEL_URI, new Date().toISOString());
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`)
+      .run(`${hash}_0`, new Float32Array([0.2, 0.8]));
+
+    const results = await store.searchVec(
+      "dimension mismatch query",
+      DEFAULT_EMBED_MODEL_URI,
+      10,
+      undefined,
+      undefined,
+      [0.1, 0.2, 0.3]
+    );
+
+    expect(results).toEqual([]);
 
     await cleanupTestDb(store);
   });
@@ -2299,10 +2356,10 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     // Create vector table and insert a vector
     store.ensureVecTable(768);
     const embedding = Array(768).fill(0).map(() => Math.random());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, new Date().toISOString());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, ?, ?)`).run(hash, DEFAULT_EMBED_MODEL_URI, new Date().toISOString());
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, new Float32Array(embedding));
 
-    const results = await store.searchVec("test query", "embeddinggemma", 10);
+    const results = await store.searchVec("test query", DEFAULT_EMBED_MODEL_URI, 10);
     expect(results).toHaveLength(1);
     expect(results[0]!.displayPath).toBe(`${collectionName}/doc1.md`);
     expect(results[0]!.filepath).toBe(`qmd://${collectionName}/doc1.md`);
@@ -2335,17 +2392,17 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     store.ensureVecTable(768);
     const embedding1 = Array(768).fill(0).map(() => Math.random());
     const embedding2 = Array(768).fill(0).map(() => Math.random());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash1, new Date().toISOString());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash2, new Date().toISOString());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, ?, ?)`).run(hash1, DEFAULT_EMBED_MODEL_URI, new Date().toISOString());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, ?, ?)`).run(hash2, DEFAULT_EMBED_MODEL_URI, new Date().toISOString());
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash1}_0`, new Float32Array(embedding1));
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash2}_0`, new Float32Array(embedding2));
 
     // Search without filter - should return both
-    const allResults = await store.searchVec("content", "embeddinggemma", 10);
+    const allResults = await store.searchVec("content", DEFAULT_EMBED_MODEL_URI, 10);
     expect(allResults).toHaveLength(2);
 
     // Search with collection filter - should return only from collection1
-    const filtered = await store.searchVec("content", "embeddinggemma", 10, collection1);
+    const filtered = await store.searchVec("content", DEFAULT_EMBED_MODEL_URI, 10, collection1);
     expect(filtered).toHaveLength(1);
     expect(filtered[0]!.collectionName).toBe(collection1);
 
@@ -2371,13 +2428,13 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     // Create vector table and insert a test vector
     store.ensureVecTable(768);
     const embedding = Array(768).fill(0).map(() => Math.random());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, new Date().toISOString());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, ?, ?)`).run(hash, DEFAULT_EMBED_MODEL_URI, new Date().toISOString());
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, new Float32Array(embedding));
 
     // This should complete quickly (not hang) due to the two-step fix
     // The old code with JOINs in the sqlite-vec query would hang indefinitely
     const startTime = Date.now();
-    const results = await store.searchVec("test content", "embeddinggemma", 5);
+    const results = await store.searchVec("test content", DEFAULT_EMBED_MODEL_URI, 5);
     const elapsed = Date.now() - startTime;
 
     // If the query took more than 5 seconds, something is wrong

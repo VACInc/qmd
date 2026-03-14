@@ -1616,7 +1616,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   }
 
   // Check if there's work to do before starting
-  const hashesToEmbed = getHashesForEmbedding(db);
+  const hashesToEmbed = getHashesForEmbedding(db, model);
   if (hashesToEmbed.length === 0 && !force) {
     console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
     closeDb();

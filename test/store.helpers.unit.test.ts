@@ -2,7 +2,7 @@
  * Store helper-level unit tests (pure logic, no model/runtime dependency).
  */
 
-import { describe, test, expect } from "vitest";
+import { describe, test, expect, vi } from "vitest";
 import {
   homedir,
   resolve,
@@ -15,6 +15,8 @@ import {
   normalizeDocid,
   isDocid,
   handelize,
+  setCachedResult,
+  clearCache,
 } from "../src/store";
 
 // =============================================================================
@@ -78,6 +80,33 @@ describe("Path Utilities", () => {
     const result = getRealPath("/tmp");
     expect(result).toBeTruthy();
     expect(result === "/tmp" || result === "/private/tmp").toBe(true);
+  });
+});
+
+describe("LLM Cache Helpers", () => {
+  test("setCachedResult ignores SQLITE_BUSY cache writes", () => {
+    const run = vi.fn(() => {
+      throw new Error("SQLITE_BUSY: database is locked");
+    });
+    const db = {
+      prepare: vi.fn(() => ({ run })),
+      exec: vi.fn(),
+    } as any;
+
+    expect(() => setCachedResult(db, "cache-key", "cached result")).not.toThrow();
+    expect(run).toHaveBeenCalled();
+  });
+
+  test("clearCache ignores SQLITE_BUSY cache clears", () => {
+    const exec = vi.fn(() => {
+      throw new Error("database is locked");
+    });
+    const db = {
+      exec,
+    } as any;
+
+    expect(() => clearCache(db)).not.toThrow();
+    expect(exec).toHaveBeenCalledWith("DELETE FROM llm_cache");
   });
 });
 
